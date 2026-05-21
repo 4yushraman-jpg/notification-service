@@ -42,12 +42,15 @@ func (c *Consumer) FetchJob(ctx context.Context) (*models.EmailJob, *kafka.Messa
 	var job models.EmailJob
 	if err := json.Unmarshal(msg.Value, &job); err != nil {
 		// POISON PILL FIX: Return the message and a specific error type
-		return nil, &msg, fmt.Errorf("%w: %s", ErrPoisonPill, err)
+		return nil, &msg, fmt.Errorf("%w: %v", ErrPoisonPill, err)
 	}
 
 	return &job, &msg, nil
 }
 
+// CommitJob advances the consumer group offset for msg.
+// With multiple worker goroutines, commits must remain ordered per partition
+// (safe when a single worker processes and commits sequentially).
 func (c *Consumer) CommitJob(ctx context.Context, msg *kafka.Message) error {
 	return c.reader.CommitMessages(ctx, *msg)
 }
