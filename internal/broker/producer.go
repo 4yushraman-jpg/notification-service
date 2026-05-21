@@ -5,34 +5,46 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	"notification-service/internal/models"
+	"log/slog"
 	"time"
+
+	"notification-service/internal/metrics"
+	"notification-service/internal/models"
 
 	"github.com/segmentio/kafka-go"
 )
 
 type Producer struct {
 	writer *kafka.Writer
+	topic  string
 }
 
 func NewProducer(brokerURLs []string, topic string) *Producer {
 	w := &kafka.Writer{
-		Addr:     kafka.TCP(brokerURLs...),
-		Topic:    topic,
-		Balancer: &kafka.LeastBytes{},
+		Addr:         kafka.TCP(brokerURLs...),
+		Topic:        topic,
+		Balancer:     &kafka.Hash{},
+		RequiredAcks: kafka.RequireAll,
 	}
-	return &Producer{writer: w}
+	return &Producer{writer: w, topic: topic}
 }
 
 func (p *Producer) PublishJobs(ctx context.Context, jobs []models.EmailJob) error {
+	start := time.Now()
+	defer func() {
+		metrics.KafkaPublishDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	var messages []kafka.Message
 
 	for _, job := range jobs {
 		jobBytes, err := json.Marshal(job)
 		if err != nil {
-			log.Printf("Failed to marshal job %s: %v", job.JobID, err)
-			continue
+			return fmt.Errorf(
+				"marshal job %s: %w",
+				job.JobID,
+				err,
+			)
 		}
 
 		messages = append(messages, kafka.Message{
@@ -41,21 +53,22 @@ func (p *Producer) PublishJobs(ctx context.Context, jobs []models.EmailJob) erro
 		})
 	}
 
-	if len(messages) == 0 {
-		return errors.New("no valid messages to publish")
-	}
-
 	var err error
 	const retries = 3
 
 	for i := 0; i < retries; i++ {
-		timeoutCtx, cancel := context.WithTimeout(ctx, time.Second)
+		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 
 		err = p.writer.WriteMessages(timeoutCtx, messages...)
 
 		cancel()
 
 		if err == nil {
+			slog.Info(
+				"kafka publish succeeded",
+				"message_count", len(messages),
+				"kafka_topic", p.topic,
+			)
 			return nil
 		}
 
@@ -63,11 +76,12 @@ func (p *Producer) PublishJobs(ctx context.Context, jobs []models.EmailJob) erro
 			errors.Is(err, context.DeadlineExceeded) ||
 			errors.Is(err, context.Canceled) {
 
-			log.Printf(
-				"Kafka transient error (attempt %d/%d): %v",
-				i+1,
-				retries,
-				err,
+			slog.Warn(
+				"kafka transient publish error",
+				"attempt", i+1,
+				"max_attempts", retries,
+				"kafka_topic", p.topic,
+				"error", err,
 			)
 
 			select {
@@ -84,6 +98,55 @@ func (p *Producer) PublishJobs(ctx context.Context, jobs []models.EmailJob) erro
 
 	return fmt.Errorf(
 		"failed to publish jobs after %d retries: %w",
+		retries,
+		err,
+	)
+}
+
+// PublishRaw writes a pre-serialized payload to the producer topic.
+func (p *Producer) PublishRaw(ctx context.Context, key string, value []byte) error {
+	start := time.Now()
+	defer func() {
+		metrics.KafkaPublishDuration.Observe(time.Since(start).Seconds())
+	}()
+
+	var err error
+	const retries = 3
+
+	msg := kafka.Message{
+		Key:   []byte(key),
+		Value: value,
+	}
+
+	for i := 0; i < retries; i++ {
+		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+
+		err = p.writer.WriteMessages(timeoutCtx, msg)
+
+		cancel()
+
+		if err == nil {
+			return nil
+		}
+
+		if errors.Is(err, kafka.LeaderNotAvailable) ||
+			errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, context.Canceled) {
+
+			select {
+			case <-time.After(250 * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+
+			continue
+		}
+
+		return fmt.Errorf("unexpected kafka error: %w", err)
+	}
+
+	return fmt.Errorf(
+		"failed to publish raw message after %d retries: %w",
 		retries,
 		err,
 	)
